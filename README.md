@@ -1,4 +1,11 @@
-# Copilot + Markdown security policy
+# Copilot + Markdown security policy (enhanced)
+
+An independent public copy, not a fork, of
+[copilot-policy-gate-demo](https://github.com/ShawnMcGough/copilot-policy-gate-demo)
+for future enhancements. All 10 source branch heads and their reachable Git
+history were copied; the source had no tags. Source `main` snapshot:
+`81b7b13c52d90d56054629e80536d55a72895a94`. The original shared repository was
+left unchanged.
 
 A deliberately simple demonstration of branch protection using GitHub Copilot
 and an organization security standard in a Markdown file. Copilot reviews PR changes against a 
@@ -74,30 +81,47 @@ Security Standard > Details** and its job summary.
 - Restore parameter binding and push a new commit: receive a fresh review.
 - Propose weaker policy alongside unsafe SQL: the base policy still applies.
 
-Demo PRs: [#16, safe parameterized SQL](https://github.com/ShawnMcGough/copilot-policy-gate-demo/pull/16)
+Original-repository demo PRs (not copied): [#16, safe parameterized SQL](https://github.com/ShawnMcGough/copilot-policy-gate-demo/pull/16)
 passes; [#17, intentionally unsafe SQL](https://github.com/ShawnMcGough/copilot-policy-gate-demo/pull/17)
 is blocked for **SEC-001** (high) at `src/example.py:22`. Each shows the single
 native **Organization Security Standard** check.
 
 ## Setup
 
+Git-tracked workflows and policy files are separate from GitHub settings.
+Credentials/secrets, account permissions, issues/PRs, and Actions event policies
+were not copied. No ruleset is active in this new repository. **Actions is
+disabled** to prevent bootstrap and scheduled runs; enable it only when ready.
+
 1. Use a Copilot-enabled account and save a fine-grained PAT with **Account
    permissions > Copilot Requests: Read** as the Actions secret
    `COPILOT_GITHUB_TOKEN`. This personal-account demo does not use
    organization-billed `GITHUB_TOKEN` inference or a separate model-provider key.
-2. If an Actions event policy restricts workflow execution, allow
+2. Enable Actions in this repository's settings when ready to run the demo.
+   If an Actions event policy restricts workflow execution, allow
    `pull_request_target` for `.github/workflows/security-compliance.yml`.
-3. After a genuine run, require **Organization Security Standard** from the
-   observed GitHub Actions App (**15368** here) in the `main` ruleset. Keep PRs
-   required, strict up-to-date checks, no force push/deletion, and no bypasses.
+3. Import the ruleset below when ready to enforce protections. After a genuine
+   run, verify **Organization Security Standard** is emitted by the expected
+   GitHub Actions App (**15368** in the export).
 4. Use trusted same-repository collaborators only. Fork PRs fail before
    credentialed analysis; the required job is not skipped to green.
 
-This repository already has the secret and
-[active `main` ruleset](https://github.com/ShawnMcGough/copilot-policy-gate-demo/rules/26989916)
-configured, with exactly one required **Organization Security Standard** check.
-Its [Actions event policy](https://github.com/ShawnMcGough/copilot-policy-gate-demo/settings/actions/rules/12942)
-admits `pull_request_target` only for `.github/workflows/security-compliance.yml`.
+### Ruleset snapshot and import
+
+[`.github/rulesets/protected-main.json`](.github/rulesets/protected-main.json)
+is an import-ready snapshot of the
+[source ruleset](https://github.com/ShawnMcGough/copilot-policy-gate-demo/rules/26989916)
+(ID `26989916`), fetched on 2026-11-12. It preserves the name, target,
+enforcement, matching conditions, every rule parameter, and bypass actors;
+server-generated identity, source, timestamps, and URL metadata are omitted.
+
+Download the JSON, then in **this new repository** open **Settings** and the
+**Rulesets** page. Choose **New ruleset > Import a ruleset**, select the file,
+review, and click **Create** when ready. The export retains
+`"enforcement": "active"`: creating the imported
+ruleset activates its protections, including the required check. **Committing
+the JSON alone does not activate anything.** No import was performed; configuring
+`COPILOT_GITHUB_TOKEN` and other Actions settings remains a separate setup step.
 
 Keep the token's entitlement, expiry, and spending controls current. The job has a
 ten-minute timeout and a thirty-AI-credit CLI limit; usage can still be billable.
