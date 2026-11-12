@@ -123,19 +123,20 @@ activate a schedule until the workflow is on `main`.
 
 ## Try the demo
 
-Open a same-repository PR targeting `main`, then open **Checks > Organization
-Security Standard > Details** and its job summary.
+Complete [Setup](#setup) first, then create your own same-repository PR targeting
+`main`:
 
-- Use parameterized SQL: pass.
-- Replace parameter binding with SQL string interpolation: fail **SEC-001**, with
-  the file/line, explanation, and a concrete fix.
-- Restore parameter binding and push a new commit: receive a fresh review.
-- Propose weaker policy alongside unsafe SQL: the base policy still applies.
+1. Make an intentionally unsafe SQL change that interpolates an untrusted value
+   into an executed query. Keep this on the demo branch; do not merge it.
+2. Open **Checks > Organization Security Standard > Details** and its job summary.
+   Expect a failed check reporting **SEC-001**, with the location, explanation,
+   and suggested fix.
+3. Replace interpolation with a parameterized query that passes values separately,
+   then push a new commit to the same PR. Observe the fresh review and passing
+   check when the report is complete and no policy violations remain.
 
-Original-repository demo PRs (not copied): [ShawnMcGough/copilot-policy-gate-demo#16](https://github.com/ShawnMcGough/copilot-policy-gate-demo/pull/16)
-uses safe parameterized SQL and passes; [ShawnMcGough/copilot-policy-gate-demo#17](https://github.com/ShawnMcGough/copilot-policy-gate-demo/pull/17)
-is blocked for **SEC-001** (high) at `src/example.py:22`. Each shows the single
-native **Organization Security Standard** check.
+Proposed policy changes do not weaken the review: the trusted base policy still
+applies.
 
 ## Setup
 
