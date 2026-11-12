@@ -1,6 +1,6 @@
-"""Offline tests of the trusted workflow steps; no Copilot calls or fixture code execution.
+"""Offline tests of trusted workflow scripts; no Copilot calls or fixture code execution.
 
-Run locally on trusted workflow changes with Python, PyYAML, Git, and Bash.
+Run locally with Python, PyYAML, Git, Bash, jq, and GNU timeout.
 Unsafe source strings below are non-executable review evidence in temporary repos.
 """
 
@@ -22,8 +22,12 @@ WORKFLOW = yaml.load(
     Loader=yaml.BaseLoader,
 )
 STEPS = WORKFLOW["jobs"]["audit"]["steps"]
-PREPARE = next(step["run"] for step in STEPS if step.get("id") == "prepare")
-PUBLISH = STEPS[-1]["run"]
+SCRIPTS = ROOT / ".github" / "scripts"
+PR_WORKFLOW = yaml.load(
+    (ROOT / ".github" / "workflows" / "security-compliance.yml").read_text(encoding="utf-8"),
+    Loader=yaml.BaseLoader,
+)
+PR_STEPS = PR_WORKFLOW["jobs"]["review"]["steps"]
 POLICY_PATH = "security/organization-standards.md"
 BASH = shutil.which("bash")
 SAFE_SOURCE = 'connection.execute("SELECT id FROM accounts WHERE email = ?", (email,))\n'
@@ -42,9 +46,12 @@ class SnapshotAuditTests(unittest.TestCase):
         self.env = {
             **os.environ,
             "RUNNER_TEMP": str(self.temp),
+            "GITHUB_WORKSPACE": str(ROOT),
             "GITHUB_STEP_SUMMARY": str(self.temp / "summary.md"),
+            "COPILOT_GITHUB_TOKEN": "nonfunctional-offline-placeholder",
             **{f"{stage}_OUTCOME": "success" for stage in ("TRUST", "CHECKOUT", "PREPARE", "INSTALL", "REVIEW")},
         }
+        self.env.pop("COPILOT_MODEL", None)
         self.git("init", "--quiet", "--initial-branch=main")
         self.git("config", "core.autocrlf", "false")
         self.write(POLICY_PATH, (ROOT / POLICY_PATH).read_text(encoding="utf-8"))
@@ -69,18 +76,28 @@ class SnapshotAuditTests(unittest.TestCase):
                  "commit", "--quiet", "--allow-empty", "-m", "Offline fixture")
         return self.git("rev-parse", "HEAD")
 
-    def run_step(self, script):
-        path = self.temp / "step.py"
-        path.write_text(script, encoding="utf-8")
+    def run_step(self, command):
         return subprocess.run(
-            [sys.executable, str(path)], cwd=self.repo, env=self.env,
+            [sys.executable, str(SCRIPTS / "security-snapshot.py"), command],
+            cwd=self.repo, env=self.env,
+            capture_output=True, text=True, encoding="utf-8",
+        )
+
+    def run_shell(self, command, **env):
+        prefix = ""
+        if os.name == "nt":
+            for name in ("RUNNER_TEMP", "GITHUB_STEP_SUMMARY", "GITHUB_WORKSPACE"):
+                prefix += f'export {name}="$(cygpath -u "${name}")"\n'
+        return subprocess.run(
+            [BASH, "-e", "-o", "pipefail", "-c", prefix + command],
+            cwd=self.repo, env={**self.env, **env},
             capture_output=True, text=True, encoding="utf-8",
         )
 
     def prepare(self, success=True):
         for name in ("prompt.txt", "snapshot.json"):
             (self.temp / name).unlink(missing_ok=True)
-        result = self.run_step(PREPARE)
+        result = self.run_step("prepare")
         self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
         self.manifest = json.loads((self.temp / "snapshot.json").read_text(encoding="utf-8"))
         self.assertEqual(self.manifest["prepared"], success)
@@ -110,7 +127,7 @@ class SnapshotAuditTests(unittest.TestCase):
         summary_path.unlink(missing_ok=True)
         raw = events if isinstance(events, str) else "\n".join(json.dumps(e) for e in events)
         (self.temp / "events.jsonl").write_text(raw, encoding="utf-8")
-        result = self.run_step(PUBLISH)
+        result = self.run_step("report")
         self.assertEqual(result.returncode, 0 if status == "PASS" else 1, result.stderr)
         summary = summary_path.read_text(encoding="utf-8")
         self.assertIn(f"**{status}**", summary)
@@ -123,6 +140,178 @@ class SnapshotAuditTests(unittest.TestCase):
             "explanation": "Untrusted email is concatenated into executed SQL.",
             "remediation": "Use a placeholder and a separate parameter collection.",
         }
+
+    def mock_cli(self, command, **env):
+        mock_bin = self.temp / "bin"
+        mock_bin.mkdir(exist_ok=True)
+        cli = mock_bin / "copilot"
+        cli.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf "%s\\0" "$@" > "$RUNNER_TEMP/args.bin"\n'
+            'pwd > "$RUNNER_TEMP/cli-cwd.txt"\n'
+            'printf "%s" "$COPILOT_HOME" > "$RUNNER_TEMP/cli-home.txt"\n'
+            'cat > "$RUNNER_TEMP/received-prompt.txt"\n'
+            'printf "%s\\n" "$MOCK_EVENTS"\n'
+            'exit "$MOCK_EXIT_CODE"\n',
+            encoding="utf-8", newline="\n",
+        )
+        cli.chmod(0o755)
+        prefix = 'export PATH="$MOCK_BIN:$PATH"\n'
+        if os.name == "nt":
+            prefix = 'MOCK_BIN="$(cygpath -u "$MOCK_BIN")"\n' + prefix
+        prefix += '[[ "$(command -v copilot)" == "$MOCK_BIN/copilot" ]] || exit 99\n'
+        return self.run_shell(
+            prefix + command, MOCK_BIN=str(mock_bin),
+            **{"MOCK_EVENTS": "", "MOCK_EXIT_CODE": "0", **env},
+        )
+
+    def test_shared_cli_default_configured_model_and_isolation(self):
+        (self.temp / "prompt.txt").write_text("Offline evidence only.", encoding="utf-8")
+        # This model-like string must remain one argument, never shell code or flags.
+        literal_model = 'model with spaces; touch MODEL_EXECUTED; $(touch MODEL_EXECUTED) --allow-all'
+        for mode in ("pr", "snapshot"):
+            for value in (None, "", "another-supported-model", literal_model):
+                with self.subTest(mode=mode, model=value):
+                    result = self.mock_cli(
+                        f'bash "$GITHUB_WORKSPACE/.github/scripts/copilot-review.sh" {mode}',
+                        **({} if value is None else {"COPILOT_MODEL": value}),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    args = (self.temp / "args.bin").read_bytes().decode().rstrip("\0").split("\0")
+                    self.assertEqual(args, [
+                        "--model", value or "claude-haiku-5.5", "--context", "long_context",
+                        "--silent", "--output-format", "json", "--available-tools=none",
+                        "--disable-builtin-mcps", "--no-custom-instructions",
+                        "--no-auto-update", "--max-ai-credits", "30",
+                    ])
+                    cwd = (self.temp / "cli-cwd.txt").read_text().strip()
+                    home = (self.temp / "cli-home.txt").read_text().strip()
+                    self.assertTrue(cwd.endswith("/" + self.temp.name), cwd)
+                    self.assertEqual(home, cwd + "/copilot-home")
+                    self.assertEqual((self.temp / "received-prompt.txt").read_text(), "Offline evidence only.")
+                    self.assertFalse((self.temp / "MODEL_EXECUTED").exists())
+                    self.assertFalse((self.repo / "MODEL_EXECUTED").exists())
+
+    def test_pr_prepare_uses_base_policy_and_never_executes_head_files(self):
+        base = self.git("rev-parse", "HEAD")
+        trusted_policy = (self.repo / POLICY_PATH).read_text(encoding="utf-8")
+        self.write(POLICY_PATH, "Proposed weaker policy; do not use for this review.\n")
+        self.write("src/query.py", UNSAFE_SOURCE)
+        self.write("doc/example.sql", "Non-executable fixture: unsafe SQL example remains in scope.\n")
+        self.write(".github/scripts/security-pr.sh", "touch PR_CODE_EXECUTED\n")
+        head = self.commit()
+        self.git("switch", "--detach", base)
+        self.git("remote", "add", "origin", str(self.repo))
+        result = self.run_shell(
+            'bash "$GITHUB_WORKSPACE/.github/scripts/security-pr.sh" prepare',
+            BASE_SHA=base, HEAD_SHA=head,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt = (self.temp / "prompt.txt").read_text(encoding="utf-8")
+        evidence = json.loads(prompt.split("Review input:\n", 1)[1])
+        self.assertEqual(evidence["policy"], trusted_policy)
+        for text in ("doc/example.sql", ".github/scripts/security-pr.sh", "Proposed weaker policy", UNSAFE_SOURCE.strip()):
+            self.assertIn(text, evidence["changes"])
+        self.assertEqual(self.git("rev-parse", "HEAD"), base)
+        self.assertFalse((self.repo / "PR_CODE_EXECUTED").exists())
+        self.assertFalse((self.repo / ".github/scripts/security-pr.sh").exists())
+
+    def test_pr_report_fails_closed_for_incomplete_invalid_and_error_events(self):
+        report = {"complete": True, "summary": "Offline fixture.", "violations": []}
+        valid = self.events(report)
+        cases = [
+            (valid, True),
+            (self.events({**report, "violations": [self.violation()]}), False),
+            (self.events({**report, "complete": False}), False),
+            (self.events({**report, "complete": "true"}), False),
+            (self.events({**report, "summary": " "}), False),
+            (self.events({**report, "violations": [{"line": 0}]}), False),
+            ("", False), ("not JSON", False), ("[]", False),
+            (valid[:-1], False), (valid + [valid[0]], False),
+            (valid + [valid[-1]], False),
+            ([valid[0], {"type": "result", "exitCode": 1}], False),
+            (valid + [{"type": "session.error", "data": {"message": "offline failure"}}], False),
+        ]
+        for events, passes in cases:
+            with self.subTest(events=events):
+                raw = events if isinstance(events, str) else "\n".join(json.dumps(e) for e in events)
+                (self.temp / "events.jsonl").write_text(raw, encoding="utf-8")
+                Path(self.env["GITHUB_STEP_SUMMARY"]).unlink(missing_ok=True)
+                result = self.run_shell('bash "$GITHUB_WORKSPACE/.github/scripts/security-pr.sh" report')
+                self.assertEqual(result.returncode == 0, passes, result.stderr)
+                summary = Path(self.env["GITHUB_STEP_SUMMARY"]).read_text(encoding="utf-8")
+                self.assertEqual("PASS:" in summary, passes)
+        (self.temp / "events.jsonl").unlink()
+        result = self.run_shell('bash "$GITHUB_WORKSPACE/.github/scripts/security-pr.sh" report')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_pr_cli_failure_rejects_success_shaped_output(self):
+        (self.temp / "prompt.txt").write_text("Offline evidence only.", encoding="utf-8")
+        events = self.events({"complete": True, "summary": "Not accepted.", "violations": []})
+        result = self.mock_cli(
+            'bash "$GITHUB_WORKSPACE/.github/scripts/copilot-review.sh" pr',
+            MOCK_EXIT_CODE="1", MOCK_EVENTS="\n".join(json.dumps(e) for e in events),
+            COPILOT_MODEL="unavailable-model",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("no compliance verdict was accepted", result.stdout)
+        self.assertIn(b"unavailable-model\0", (self.temp / "args.bin").read_bytes())
+
+    def test_snapshot_timeout_is_nonzero_and_does_not_run_cli(self):
+        (self.temp / "prompt.txt").write_text("Offline evidence only.", encoding="utf-8")
+        mock_bin = self.temp / "bin"
+        mock_bin.mkdir()
+        timer = mock_bin / "timeout"
+        timer.write_text(
+            '#!/usr/bin/env bash\n'
+            'printf "%s\\0" "$@" > "$RUNNER_TEMP/timeout-args.bin"\nexit 124\n',
+            encoding="utf-8", newline="\n",
+        )
+        timer.chmod(0o755)
+        result = self.mock_cli('bash "$GITHUB_WORKSPACE/.github/scripts/copilot-review.sh" snapshot')
+        self.assertEqual(result.returncode, 124, result.stderr)
+        args = (self.temp / "timeout-args.bin").read_bytes().split(b"\0")
+        self.assertEqual(args[:2], [b"5m", b"copilot"])
+        self.assertFalse((self.temp / "args.bin").exists())
+
+    def test_snapshot_early_summary_never_runs_repository_script(self):
+        self.write(".github/scripts/security-snapshot.py", 'raise RuntimeError("UNTRUSTED_SCRIPT_RAN")\n')
+        for stage in ("TRUST", "CHECKOUT"):
+            with self.subTest(stage=stage):
+                result = self.run_shell(STEPS[-1]["run"], **{f"{stage}_OUTCOME": "failure"})
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("UNTRUSTED_SCRIPT_RAN", result.stdout + result.stderr)
+                summary = Path(self.env["GITHUB_STEP_SUMMARY"]).read_text(encoding="utf-8")
+                self.assertIn("**ERROR**", summary)
+
+    def test_pr_admission_and_trusted_script_wiring(self):
+        self.assertEqual(list(PR_WORKFLOW["jobs"]), ["review"])
+        self.assertEqual(PR_WORKFLOW["on"], {"pull_request_target": {
+            "branches": ["main"],
+            "types": ["opened", "reopened", "synchronize", "ready_for_review", "edited"],
+        }})
+        self.assertEqual(PR_STEPS[1]["with"]["ref"], "${{ github.event.pull_request.base.sha }}")
+        self.assertEqual(PR_STEPS[1]["with"]["persist-credentials"], "false")
+        self.assertEqual(PR_STEPS[2]["run"], "bash .github/scripts/security-pr.sh prepare")
+        self.assertEqual(PR_STEPS[4]["run"], 'bash "$GITHUB_WORKSPACE/.github/scripts/copilot-review.sh" pr')
+        self.assertEqual(PR_STEPS[5]["run"], 'bash "$GITHUB_WORKSPACE/.github/scripts/security-pr.sh" report')
+        for workflow in (PR_WORKFLOW, WORKFLOW):
+            self.assertEqual(workflow["env"]["COPILOT_MODEL"], "${{ vars.COPILOT_MODEL }}")
+            for job in workflow["jobs"].values():
+                self.assertEqual(job["timeout-minutes"], "10")
+                for step in job["steps"]:
+                    if "run" in step:
+                        subprocess.run([BASH, "-n"], input=step["run"].encode(), check=True)
+        for head, expected in (("owner/repo", 0), ("outsider/repo", 1), ("", 1)):
+            result = self.run_shell(
+                PR_STEPS[0]["run"], GITHUB_REPOSITORY="owner/repo", HEAD_REPOSITORY=head,
+            )
+            self.assertEqual(result.returncode, expected, result.stderr)
+        ruleset = json.loads((ROOT / ".github/rulesets/protected-main.json").read_text())
+        check = next(rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks")
+        self.assertEqual(check["parameters"]["required_status_checks"], [{
+            "context": PR_WORKFLOW["jobs"]["review"]["name"], "integration_id": 15368,
+        }])
 
     def test_clean_snapshot_and_uncommitted_policy_are_pinned_to_one_commit(self):
         commit = self.git("rev-parse", "HEAD")
@@ -228,16 +417,14 @@ class SnapshotAuditTests(unittest.TestCase):
         if os.name == "nt":
             prefix = 'MOCK_BIN="$(cygpath -u "$MOCK_BIN")"\n' + prefix
         prefix += '[[ "$(command -v copilot)" == "$MOCK_BIN/copilot" ]] || exit 99\n'
-        result = subprocess.run(
-            [BASH, "-c", prefix + review], cwd=self.temp, capture_output=True,
-            env={**self.env, "MOCK_BIN": str(mock_bin),
-                 "COPILOT_HOME": str(self.temp / "copilot-home"),
-                 "COPILOT_GITHUB_TOKEN": "nonfunctional-offline-placeholder",
-                 "MOCK_EVENTS": "\n".join(json.dumps(e) for e in self.events(self.report()))},
+        result = self.run_shell(
+            prefix + review, MOCK_BIN=str(mock_bin),
+            COPILOT_GITHUB_TOKEN="nonfunctional-offline-placeholder",
+            MOCK_EVENTS="\n".join(json.dumps(e) for e in self.events(self.report())),
         )
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(result.stdout, b"")
-        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
         self.env["REVIEW_OUTCOME"] = "failure"
         summary = self.publish((self.temp / "events.jsonl").read_text(encoding="utf-8"), "ERROR")
         self.assertIn("CLI installation/review failed", summary)
@@ -278,6 +465,10 @@ class SnapshotAuditTests(unittest.TestCase):
         self.assertEqual(WORKFLOW["on"], {"schedule": [{"cron": "17 9 * * 1"}], "workflow_dispatch": ""})
         self.assertEqual(WORKFLOW["permissions"], {"contents": "read"})
         self.assertEqual(STEPS[-1]["if"], "always()")
+        self.assertEqual(STEPS[1]["with"], {"ref": "refs/heads/main", "persist-credentials": "false"})
+        self.assertEqual(STEPS[2]["run"], "python3 .github/scripts/security-snapshot.py prepare")
+        self.assertEqual(STEPS[4]["run"], 'bash "$GITHUB_WORKSPACE/.github/scripts/copilot-review.sh" snapshot')
+        self.assertTrue(STEPS[-1]["run"].endswith("python3 .github/scripts/security-snapshot.py report\n"))
         base_env = {
             **os.environ, "GITHUB_REPOSITORY": "owner/repo", "GITHUB_REF": "refs/heads/main",
             "GITHUB_EVENT_NAME": "workflow_dispatch",
